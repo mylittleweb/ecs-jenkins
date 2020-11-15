@@ -1,0 +1,250 @@
+# source: https://tomgregory.com/using-jenkins-configuration-as-code-to-setup-aws-slave-agents-automatically/
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  ParentZoneId:
+    Type: String
+
+  DomainName:
+    Type: String
+
+Resources:
+  # dns setup
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+
+  # TLS cert
+  AcmCert:
+    DependsOn: HostedZone
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub "*.${DomainName}"
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+
+  # zone delegation
+  ZoneDelegation:
+    DependsOn:
+      - HostedZone
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ParentZoneId
+      Name: !Ref DomainName
+      Type: NS
+      ResourceRecords: !GetAtt HostedZone.NameServers
+      TTL: 300
+
+  # vpc
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'VPC - CI'
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'IGW - CI'
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # private subnets, starting from bottom, going up
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Private Subnet 1 - CI'
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Private Subnet 2 - CI'
+
+  # public subnets, starting from top, going down
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.224.0/20
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Public Subnet 2 - CI'
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.240.0/20
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub 'Public Subnet 1 - CI'
+
+  # nat gateway
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'Public Route Table - CI'
+  PublicRouteTableEntry:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteTableSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicRouteTableSubnetAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'Private Route Table 1 - CI'
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'Private Route Table 2 - CI'
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  JenkinsMasterRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ea/jenkins-master
+      ImageTagMutability: IMMUTABLE
+
+  JenkinsWOrkerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ea/jenkins-worker
+      ImageTagMutability: IMMUTABLE
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: ci-VpcId
+  PrivateSubnet1:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: ci-PrivateSubnet1
+  PrivateSubnet2:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: ci-PrivateSubnet2
+  PublicSubnet1:
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: ci-PublicSubnet1
+  PublicSubnet2:
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: ci-PublicSubnet2
+
+  DnsZoneId:
+    Value: !Ref HostedZone
+    Export:
+      Name: ci-DnsZoneId
+  DomainName:
+    Value: !Ref DomainName
+    Export:
+      Name: ci-DomainName
+  AcmCertArn:
+    Value: !Ref AcmCert
+    Export:
+      Name: ci-AcmCertArn
