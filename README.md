@@ -1,4 +1,4 @@
-#Prerequisite
+# Prerequisite
 
 Install the following binaries:
 * awscli (https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html)
